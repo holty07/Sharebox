@@ -12,7 +12,7 @@ run_worker_first = ["/api/*"]
 [[d1_databases]]
 binding = "DB"
 database_name = "sharebox"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "9d3ba962-e9be-4ec5-89a9-04d2fafa3478"
 migrations_dir = "migrations"
 
 # Secrets (wrangler secret put): SHAREBOX_JWT_SECRET, GEMINI_API_KEY

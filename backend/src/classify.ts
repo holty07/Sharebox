@@ -99,7 +99,12 @@ export async function classifyItem(item: Item, collections: Collection[], env: E
     await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
   }
   if (!res || !res.ok) {
-    const detail = res ? (await res.text()).slice(0, 300) : '';
+    const raw = res ? await res.text() : '';
+    let detail = raw.slice(0, 300);
+    try {
+      detail = (JSON.parse(raw) as { error?: { message?: string } }).error?.message ?? detail;
+    } catch { /* not JSON: keep the raw prefix */ }
+    console.error('gemini', res?.status, raw.slice(0, 2000));
     throw new Error(`Gemini request failed (${res?.status ?? 'no response'}): ${detail}`);
   }
 
