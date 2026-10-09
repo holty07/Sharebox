@@ -1,349 +1,156 @@
 /**
- * src/sync.ts
+ * Row-level last-write-wins sync.
  *
- * Two-way sync for `collections` and `items` using an append-only op log
- * + field-level HLC merge (the Budget App pattern).
- *
- *   POST /sync/push  { ops: [{op, entity, entityId, payload}] }
- *   GET  /sync/pull  ?since=<n>  -> { ops: [...], serverMaxSeq }
- *
- * Ops are appended atomically; the client pulls every op with seq > since.
- * The merge function compares field-level vectors with a hybrid logical
- * clock so a conflict on the same field is resolved by the higher HLC
- * (i.e. the later-writer wins) and removed rows are handled explicitly.
+ * Every write (REST or /api/sync/push) is a full-row put carrying an HLC
+ * string. HLCs are fixed-width ("<13-digit ms>-<4-digit counter>-<node>") so
+ * plain string comparison orders them. A put is accepted only if its HLC is
+ * newer than the stored row's; accepted puts are appended to sync_op.
  */
-import type { D1Database } from '@cloudflare/workers-types';
+import type { Env } from './env';
 
-export interface PushOp {
-  op: 'create' | 'update' | 'delete';
-  entity: 'collections' | 'items';
-  entityId: string;
-  payload: string;
-  actor: string;
+export type Entity = 'collections' | 'items';
+export type ItemKind = 'link' | 'text' | 'image';
+
+export interface Collection {
+  id: string;
+  name: string;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
   hlc: string;
 }
 
-export interface PushRequest {
-  ops: PushOp[];
+export interface Item {
+  id: string;
+  collection_id: string;
+  subject: string;
+  kind: ItemKind;
+  content: string;
+  tags: string[];
+  notes: string;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+  hlc: string;
 }
 
-export interface PullResponse {
-  ops: PullOp[];
-  serverMaxSeq: number;
+export type Row = Collection | Item;
+
+export interface PushOp {
+  entity: Entity;
+  row: Row;
 }
 
 export interface PullOp {
   seq: number;
-  op: PushOp['op'];
-  entity: PushOp['entity'];
-  entityId: string;
-  payload: string;
-  actor: string;
-  hlc: string;
-  receivedAt: string;
+  entity: Entity;
+  row: Row;
 }
 
-export interface ItemState {
-  id: string;
-  collectionId: string;
-  subject: string;
-  kind: string;
-  content: string;
-  tags: Record<string, string[]>;
-  notes: string;
-  status: string;
-  createdAt: string;
-  updatedAt: string;
-  deletedAt: string | null;
+export const UNCATEGORIZED_ID = 'uncategorized';
+const MAX_CONTENT = 1_500_000; // keeps a downscaled image data URL under D1's row limit
+
+let serverCounter = 0;
+export function serverHlc(): string {
+  serverCounter = (serverCounter + 1) % 10_000;
+  return `${String(Date.now()).padStart(13, '0')}-${String(serverCounter).padStart(4, '0')}-server`;
 }
 
-export interface CollectionState {
-  id: string;
-  name: string;
-  createdAt: string;
-  updatedAt: string;
-  deletedAt: string | null;
+const HLC_RE = /^\d{13}-\d{4}-[\w-]{1,40}$/;
+
+function str(v: unknown, field: string, max = 2000): string {
+  if (typeof v !== 'string') throw new Error(`${field} must be a string`);
+  if (v.length > max) throw new Error(`${field} too long`);
+  return v;
 }
 
-export function nowIso(): string {
-  return new Date().toISOString();
+function optStr(v: unknown, field: string): string | null {
+  return v === null || v === undefined ? null : str(v, field);
 }
 
-export function genId(): string {
-  return cryptoObj.randomUUID();
-}
-
-const ENTITIES = ['collections', 'items'] as const;
-
-function randOpId(): string {
-  return cryptoObj.randomUUID();
-}
-
-export function parseHlc(s: string): number[] {
-  return s.split('.').map((p) => parseInt(p, 10));
-}
-
-export function hlcToString(parts: number[]): string {
-  return parts.join('.');
-}
-
-/**
- * Field-level HLC merge.
- *
- * For a single entity, the server keeps a per-field "last-written" vector.
- * When merging a client row into the server row:
- *   - if the field is absent in the old row and present in the new, take new
- *   - if both present, compare HLC: the higher vector wins; a tie is broken
- *     by the higher actor (deterministic)
- *   - if the new row's HLC is strictly dominated by the old row's HLC for a
- *     field, the old value is kept (client was overwritten by someone else)
- */
-export function mergeEntity(
-  oldDoc: Record<string, unknown> | null,
-  newDoc: Record<string, unknown>,
-  hlc: number[],
-): Record<string, unknown> {
-  const out: Record<string, unknown> = oldDoc ? { ...oldDoc } : {};
-  const newHlc = hlc.slice();
-
-  for (const [k, v] of Object.entries(newDoc)) {
-    const oldVal = out[k];
-    const oldHlc = parseHlc(out._hlc ?? '0.0.0' as string);
-
-    if (oldVal === undefined) {
-      out[k] = v;
-      continue;
-    }
-
-    const cmp = compareHlc(oldHlc, newHlc);
-    if (cmp < 0) {
-      out[k] = v;
-    } else if (cmp === 0) {
-      const oldActor = String((out as Record<string, unknown>)._actor ?? '');
-      const newActor = String((newDoc as Record<string, unknown>)._actor ?? '');
-      if (newActor > oldActor) {
-        out[k] = v;
-      }
-    }
+/** Validate an untrusted row and return a clean copy with only known fields. */
+export function cleanRow(entity: Entity, raw: unknown): Row {
+  if (!raw || typeof raw !== 'object') throw new Error('row must be an object');
+  const r = raw as Record<string, unknown>;
+  const hlc = str(r.hlc, 'hlc');
+  if (!HLC_RE.test(hlc)) throw new Error('bad hlc');
+  const base = {
+    id: str(r.id, 'id', 100),
+    created_at: str(r.created_at, 'created_at'),
+    updated_at: str(r.updated_at, 'updated_at'),
+    deleted_at: optStr(r.deleted_at, 'deleted_at'),
+    hlc,
+  };
+  if (entity === 'collections') {
+    return { ...base, name: str(r.name, 'name', 200).trim() || 'Untitled' };
   }
-
-  out._hlc = hlcToString(newHlc);
-  return out;
+  const kind = r.kind;
+  if (kind !== 'link' && kind !== 'text' && kind !== 'image') throw new Error('bad kind');
+  const tags = Array.isArray(r.tags) ? r.tags.filter((t): t is string => typeof t === 'string').slice(0, 50) : [];
+  return {
+    ...base,
+    collection_id: str(r.collection_id, 'collection_id', 100) || UNCATEGORIZED_ID,
+    subject: str(r.subject, 'subject', 5000),
+    kind,
+    content: str(r.content, 'content', MAX_CONTENT),
+    tags,
+    notes: typeof r.notes === 'string' ? str(r.notes, 'notes', 10_000) : '',
+  };
 }
 
-function compareHlc(a: number[], b: number[]): number {
-  const len = Math.max(a.length, b.length);
-  for (let i = 0; i < len; i += 1) {
-    const av = i < a.length ? a[i] : 0;
-    const bv = i < b.length ? b[i] : 0;
-    if (av < bv) return -1;
-    if (av > bv) return 1;
+function upsertStmt(db: D1Database, entity: Entity, row: Row): D1PreparedStatement {
+  if (entity === 'collections') {
+    const c = row as Collection;
+    return db
+      .prepare(
+        `INSERT INTO collections (id, name, created_at, updated_at, deleted_at, hlc) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at,
+           deleted_at = excluded.deleted_at, hlc = excluded.hlc`,
+      )
+      .bind(c.id, c.name, c.created_at, c.updated_at, c.deleted_at, c.hlc);
   }
-  return 0;
+  const i = row as Item;
+  return db
+    .prepare(
+      `INSERT INTO items (id, collection_id, subject, kind, content, tags, notes, created_at, updated_at, deleted_at, hlc)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET collection_id = excluded.collection_id, subject = excluded.subject,
+         kind = excluded.kind, content = excluded.content, tags = excluded.tags, notes = excluded.notes,
+         updated_at = excluded.updated_at, deleted_at = excluded.deleted_at, hlc = excluded.hlc`,
+    )
+    .bind(i.id, i.collection_id, i.subject, i.kind, i.content, JSON.stringify(i.tags), i.notes,
+      i.created_at, i.updated_at, i.deleted_at, i.hlc);
 }
 
-export async function applyPush(
-  db: D1Database,
-  ops: PushOp[],
-  actor: string,
-): Promise<{ applied: number; rejected: number }> {
-  let applied = 0;
-  let rejected = 0;
-  let lastHlc = '0.0.0';
-
-  for (const op of ops) {
-    const { op: kind, entity, entityId, payload, hlc } = op;
-
-    if (!ENTITIES.includes(entity as (typeof ENTITIES)[number])) {
-      rejected += 1;
-      continue;
-    }
-    if (actor === '') {
-      rejected += 1;
-      continue;
-    }
-
-    const opHlc = hlc || lastHlc;
-
-    switch (kind) {
-      case 'create': {
-        if (entity === 'collections') {
-          const existing = await db
-            .prepare('SELECT id FROM collections WHERE id = ? AND deleted_at IS NULL')
-            .bind(entityId)
-            .first();
-          if (existing) { rejected += 1; continue; }
-          const row = JSON.parse(payload) as Record<string, unknown>;
-          row.id = entityId;
-          row.created_at = nowIso();
-          row.updated_at = row.created_at;
-          row.deleted_at = null;
-          await db
-            .prepare(
-              'INSERT INTO collections (id, name, created_at, updated_at, deleted_at) VALUES (?, ?, ?, ?, ?)',
-            )
-            .bind(
-              row.id,
-              row.name ?? '',
-              row.created_at ?? '',
-              row.updated_at ?? '',
-              row.deleted_at ?? null,
-            )
-            .run();
-        } else {
-          const existing = await db
-            .prepare('SELECT id FROM items WHERE id = ? AND deleted_at IS NULL')
-            .bind(entityId)
-            .first();
-          if (existing) { rejected += 1; continue; }
-          const row = JSON.parse(payload) as Record<string, unknown>;
-          row.id = entityId;
-          row.created_at = nowIso();
-          row.updated_at = row.updated_at ?? row.created_at;
-          row.deleted_at = null;
-          await db
-            .prepare(
-              'INSERT INTO items (id, collection_id, subject, kind, content, tags, notes, status, created_at, updated_at, deleted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            )
-            .bind(
-              row.id,
-              row.collection_id ?? '',
-              row.subject ?? '',
-              row.kind ?? 'text',
-              row.content ?? '',
-              row.tags ?? '{}',
-              row.notes ?? null,
-              row.status ?? 'queued',
-              row.created_at ?? '',
-              row.updated_at ?? '',
-              row.deleted_at ?? null,
-            )
-            .run();
-        }
-        applied += 1;
-        lastHlc = opHlc;
-        break;
-      }
-      case 'update': {
-        if (entity === 'collections') {
-          const row = await db
-            .prepare('SELECT * FROM collections WHERE id = ? AND deleted_at IS NULL')
-            .bind(entityId)
-            .first();
-          if (!row) { rejected += 1; continue; }
-          const doc = JSON.parse(payload) as Record<string, unknown>;
-          const merged = mergeEntity(row, doc, parseHlc(opHlc));
-          await db
-            .prepare('UPDATE collections SET name = ?, updated_at = ? WHERE id = ?')
-            .bind(merged.name ?? '', nowIso(), entityId)
-            .run();
-        } else {
-          const row = await db
-            .prepare('SELECT * FROM items WHERE id = ? AND deleted_at IS NULL')
-            .bind(entityId)
-            .first();
-          if (!row) { rejected += 1; continue; }
-          const doc = JSON.parse(payload) as Record<string, unknown>;
-          const merged = mergeEntity(row, doc, parseHlc(opHlc));
-          await db
-            .prepare(
-              'UPDATE items SET collection_id = ?, subject = ?, kind = ?, content = ?, tags = ?, notes = ?, status = ?, updated_at = ? WHERE id = ?',
-            )
-            .bind(
-              merged.collection_id ?? '',
-              merged.subject ?? '',
-              merged.kind ?? 'text',
-              merged.content ?? '',
-              merged.tags ?? '{}',
-              merged.notes ?? null,
-              merged.status ?? 'queued',
-              nowIso(),
-              entityId,
-            )
-            .run();
-        }
-        applied += 1;
-        lastHlc = opHlc;
-        break;
-      }
-      case 'delete': {
-        if (entity === 'collections') {
-          await db
-            .prepare('UPDATE collections SET deleted_at = ? WHERE id = ?')
-            .bind(nowIso(), entityId)
-            .run();
-        } else {
-          await db
-            .prepare('UPDATE items SET deleted_at = ? WHERE id = ?')
-            .bind(nowIso(), entityId)
-            .run();
-        }
-        applied += 1;
-        lastHlc = opHlc;
-        break;
-      }
-      default: {
-        rejected += 1;
-      }
-    }
-  }
-
-  return { applied, rejected };
+/** Apply one put with LWW. Returns true if it was newer and got stored. */
+export async function applyOp(env: Env, entity: Entity, row: Row, actor: string): Promise<boolean> {
+  const current = await env.DB.prepare(`SELECT hlc FROM ${entity} WHERE id = ?`).bind(row.id).first<{ hlc: string }>();
+  if (current && current.hlc >= row.hlc) return false;
+  await env.DB.batch([
+    upsertStmt(env.DB, entity, row),
+    env.DB
+      .prepare('INSERT INTO sync_op (entity, entity_id, payload, actor, hlc, received_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .bind(entity, row.id, JSON.stringify(row), actor, row.hlc, new Date().toISOString()),
+  ]);
+  return true;
 }
 
-export async function pullOps(
-  db: D1Database,
-  since: number,
-): Promise<PullResponse> {
-  const rows = await db
-    .prepare('SELECT seq, op_id, entity, entity_id, payload, actor, hlc, received_at FROM sync_op WHERE seq > ? ORDER BY seq ASC')
-    .bind(since)
-    .all();
-
-  const ops: PullOp[] = (rows.results ?? []).map((r: Record<string, unknown>) => ({
-    seq: toInt(r.seq),
-    op: r.op as PullOp['op'],
-    entity: r.entity as PullOp['entity'],
-    entityId: r.entity_id,
-    payload: r.payload,
-    actor: r.actor,
-    hlc: r.hlc,
-    receivedAt: r.received_at,
-  }));
-
-  const maxSeq = await db
-    .prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM sync_op')
-    .first();
-
-  return { ops, serverMaxSeq: toInt(maxSeq?.m) };
+export async function maxSeq(env: Env): Promise<number> {
+  const r = await env.DB.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM sync_op').first<{ m: number }>();
+  return Number(r?.m ?? 0);
 }
 
-function toInt(v: unknown): number {
-  return typeof v === 'number' ? v : (Number(v) || 0);
+export async function pullOps(env: Env, since: number, limit = 500): Promise<{ ops: PullOp[]; serverMaxSeq: number; more: boolean }> {
+  const res = await env.DB
+    .prepare('SELECT seq, entity, payload FROM sync_op WHERE seq > ? ORDER BY seq ASC LIMIT ?')
+    .bind(since, limit + 1)
+    .all<{ seq: number; entity: Entity; payload: string }>();
+  const rows = res.results ?? [];
+  const more = rows.length > limit;
+  const ops = rows.slice(0, limit).map((r) => ({ seq: Number(r.seq), entity: r.entity, row: JSON.parse(r.payload) as Row }));
+  return { ops, serverMaxSeq: await maxSeq(env), more };
 }
 
-export async function appendOps(
-  db: D1Database,
-  ops: { op: string; entity: string; entityId: string; payload: string; actor: string; hlc: string }[],
-): Promise<number> {
-  if (ops.length === 0) return 0;
-  const stmt = db.prepare(
-    'INSERT INTO sync_op (op_id, op, entity, entity_id, payload, actor, hlc, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-  );
-  for (const o of ops) {
-    stmt.bind(
-      randOpId(),
-      o.op,
-      o.entity,
-      o.entityId,
-      o.payload,
-      o.actor,
-      o.hlc,
-      nowIso(),
-    ).run();
-  }
-  const last = await db
-    .prepare('SELECT seq FROM sync_op WHERE rowid = (SELECT MAX(rowid) FROM sync_op)')
-    .first();
-  return toInt(last?.seq);
+export function itemFromDb(r: Record<string, unknown>): Item {
+  return { ...(r as unknown as Item), tags: JSON.parse(String(r.tags ?? '[]')) as string[] };
 }

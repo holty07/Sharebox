@@ -1,194 +1,83 @@
-/**
- * Sharebox — fetch helpers for the worker API.
- *
- * The frontend talks to ONE place only: the worker.
- * It never calls Google Gemini directly.
- *
- * Auth: worker returns `{ access_token, refresh_token, user }` at
- * `/auth/login` / `/auth/register`; the client keeps the access token
- * (short-lived) in memory + `localStorage` (per-tab) so reloads survive.
- */
-import type { Collection, Item, PushOp, PullOp, ClassifyRequest, ClassifyResult, AuthTokens, AuthUser } from './lib/schema';
+/** Fetch helpers for the Worker API (same origin, under /api) plus the stored session. */
+import type { ClassifyResult, PullOp, PushOp, User } from './lib/schema';
 
-export const API_BASE = '';
-const TOKEN_KEY = 'sharebox_access_token';
+const SESSION_KEY = 'sharebox_session';
 
-export function getToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY);
+export interface Session {
+  token: string;
+  user: User;
 }
 
-export function setToken(token: string | null): void {
-  if (token) localStorage.setItem(TOKEN_KEY, token);
-  else localStorage.removeItem(TOKEN_KEY);
+let session: Session | null = readSession();
+const listeners = new Set<() => void>();
+
+function readSession(): Session | null {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    return raw ? (JSON.parse(raw) as Session) : null;
+  } catch {
+    return null;
+  }
 }
 
-export function authHeaders(overrideToken?: string | null): Record<string, string> {
-  const t = overrideToken ?? getToken();
-  const h: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (t) h['Authorization'] = `Bearer ${t}`;
-  return h;
+export function getSession(): Session | null {
+  return session;
 }
 
-async function get<T>(url: string, headers?: Record<string, string>): Promise<T> {
-  const res = await fetch(`${API_BASE}${url}`, { headers: { ...authHeaders(), ...headers } });
-  return handle(res);
+export function setSession(next: Session | null): void {
+  session = next;
+  try {
+    if (next) localStorage.setItem(SESSION_KEY, JSON.stringify(next));
+    else localStorage.removeItem(SESSION_KEY);
+  } catch { /* storage unavailable: session lives for this tab only */ }
+  listeners.forEach((fn) => fn());
 }
 
-async function post<T>(url: string, body: unknown, headers?: Record<string, string>): Promise<T> {
-  const res = await fetch(`${API_BASE}${url}`, {
-    method: 'POST',
-    headers: { ...authHeaders(), ...(headers ?? {}) },
+export function subscribeSession(fn: () => void): () => void {
+  listeners.add(fn);
+  return () => listeners.delete(fn);
+}
+
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
+async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  if (session) headers.Authorization = `Bearer ${session.token}`;
+  const res = await fetch(`/api${path}`, {
+    method,
+    headers,
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  return handle(res);
+  if (res.status === 401 && session) setSession(null);
+  if (res.status === 204) return undefined as T;
+  const data = (await res.json().catch(() => null)) as { error?: string } | null;
+  if (!res.ok) throw new ApiError(data?.error ?? `Request failed (${res.status})`, res.status);
+  return data as T;
 }
 
-async function patch<T>(url: string, body: unknown): Promise<T> {
-  const res = await fetch(`${API_BASE}${url}`, {
-    method: 'PATCH',
-    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  return handle(res);
+export async function register(email: string, password: string, displayName: string): Promise<void> {
+  setSession(await request<Session>('POST', '/auth/register', { email, password, displayName }));
 }
 
-async function del<T>(url: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${url}`, { method: 'DELETE', headers: authHeaders() });
-  return handle(res);
+export async function login(email: string, password: string): Promise<void> {
+  setSession(await request<Session>('POST', '/auth/login', { email, password }));
 }
 
-async function handle<T>(res: Response): Promise<T> {
-  if (res.status === 204) return undefined as unknown as T;
-  if (res.status === 401) {
-    setToken(null); // Expired token: clear and let UI force a login.
-  }
-  const text = await res.text();
-  if (!res.ok) {
-    let msg = `Request failed (${res.status})`;
-    try {
-      const err = JSON.parse(text) as { error?: string };
-      if (err.error) msg = err.error;
-    } catch {
-      /* ignore */
-    }
-    throw new Error(msg);
-  }
-  if (text === '' || text === 'null') return undefined as unknown as T;
-  try {
-    return JSON.parse(text) as T;
-  } catch {
-    return text as unknown as T;
-  }
+export function pushOps(actor: string, ops: PushOp[]) {
+  return request<{ results: { id: string; accepted: boolean; error?: string }[]; serverMaxSeq: number }>(
+    'POST', '/sync/push', { actor, ops },
+  );
 }
 
-/*****************************************************************************
- * Auth
- *****************************************************************************/
-
-export interface AuthUser {
-  id: string;
-  email: string;
-  display_name: string;
+export function pullOps(since: number) {
+  return request<{ ops: PullOp[]; serverMaxSeq: number; more: boolean }>('GET', `/sync/pull?since=${since}`);
 }
 
-export interface AuthTokens {
-  access_token: string;
-  refresh_token: string;
-  user: AuthUser;
-}
-
-export async function register(email: string, password: string, displayName: string): Promise<AuthTokens> {
-  return post('/auth/register', { email, password, displayName });
-}
-
-export async function login(email: string, password: string): Promise<AuthTokens> {
-  return post('/auth/login', { email, password });
-}
-
-/*****************************************************************************
- * Collections
- *****************************************************************************/
-
-export async function listCollections(): Promise<Collection[]> {
-  return get('/collections');
-}
-
-export async function createCollectionOnServer(name: string): Promise<Collection> {
-  return post('/collections', { name });
-}
-
-export async function updateCollectionServer(id: string, name: string): Promise<Collection> {
-  return patch(`/collections/${id}`, { name });
-}
-
-export async function deleteCollectionServer(id: string): Promise<void> {
-  await del(`/collections/${id}`);
-}
-
-/*****************************************************************************
- * Items
- *****************************************************************************/
-
-export type ItemKind = 'link' | 'text' | 'image';
-
-export async function listItems(opts: { collectionId?: string; q?: string }): Promise<Item[]> {
-  const params = new URLSearchParams();
-  if (opts.collectionId) params.set('collection', opts.collectionId);
-  if (opts.q) params.set('q', opts.q);
-  const qs = params.toString();
-  return get(`/items${qs ? `?${qs}` : ''}`);
-}
-
-export async function getItem(id: string): Promise<Item> {
-  return get(`/items/${id}`);
-}
-
-export async function createItemOnServer(item: Omit<Item, 'id' | 'created_at' | 'updated_at'>): Promise<Item> {
-  return post('/items', item);
-}
-
-export async function updateItemServer(id: string, patch: Partial<Item>): Promise<Item> {
-  return patch(`/items/${id}`, patch);
-}
-
-export async function deleteItemServer(id: string): Promise<void> {
-  await del(`/items/${id}`);
-}
-
-/*****************************************************************************
- * Classification (server-side only — triggered from ItemDetail)
- *****************************************************************************/
-
-export async function classifyServer(req: ClassifyRequest): Promise<ClassifyResult> {
-  return post('/classify', req);
-}
-
-/*****************************************************************************
- * Sync
- *****************************************************************************/
-
-export async function pushSync(ops: PushOp[]): Promise<{ applied: number; rejected: number; serverMaxSeq: number }> {
-  return post('/sync/push', { ops });
-}
-
-export interface PullResponse {
-  ops: PullOp[];
-  serverMaxSeq: number;
-}
-
-export async function pullSync(since: number): Promise<PullResponse> {
-  return get(`/sync/pull?since=${since}`);
-}
-
-/*****************************************************************************
- * Helpers
- *****************************************************************************/
-
-export function retry<T>(fn: () => Promise<T>, max = 3, delay = 600): Promise<T> {
-  return fn().catch((err) => {
-    if (max <= 1) throw err;
-    return new Promise((resolve, reject) => {
-      setTimeout(() => retry(fn, max - 1, delay * 2).then(resolve).catch(reject), delay);
-    });
-  });
+export function classify(itemId: string) {
+  return request<ClassifyResult>('POST', '/classify', { itemId });
 }

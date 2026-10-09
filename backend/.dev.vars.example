@@ -1,0 +1,4 @@
+# Copy to backend/.dev.vars for `wrangler dev`. Never commit the real file.
+# In production set these with: wrangler secret put <NAME>
+SHAREBOX_JWT_SECRET=replace-with-a-random-string-of-at-least-32-chars
+GEMINI_API_KEY=your-google-ai-studio-key

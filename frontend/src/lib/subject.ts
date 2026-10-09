@@ -1,9 +1,4 @@
-/**
- * Build a stable "subject" string (and hash) from a share payload.
- *
- * Classification is keyed on content, so the subject must be
- * deterministic for the same shared item.
- */
+/** Turn a share-sheet payload (or manual input) into the fields of a new item. */
 import type { ItemKind } from './schema';
 
 export interface SharePayload {
@@ -11,41 +6,52 @@ export interface SharePayload {
   text: string;
   url: string;
   files: File[];
-  subjectType: ItemKind;
 }
 
-/** From a share target entry (`title`, `text`, `url`, `files`). */
-export function buildPayload(share: ShareData): SharePayload {
-  const files = (share.files ?? []).filter((f): f is File => f !== null && f.size > 0);
-  const text = (share.text ?? '').trim();
-  const url = (share.url ?? '').trim();
-  const title = (share.title ?? '').trim();
-
-  const subjectType: ItemKind =
-    files.length > 0 ? 'image' : url && url.startsWith('http') ? 'link' : text ? 'text' : 'text';
-
-  return { title, text, url, files, subjectType };
+export interface Draft {
+  kind: ItemKind;
+  subject: string;
+  content: string;
 }
 
-export function buildSubject(payload: SharePayload): string {
-  const { title, text, url } = payload;
-  const parts = [title, text, url].filter(Boolean);
-  return parts.join('\n');
-}
+const URL_RE = /https?:\/\/[^\s<>"]+/i;
 
-/** FNV-1a 64-bit style hash used to dedupe identical shares. */
-export function contentHash(subject: string): string {
-  const buf = new TextEncoder().encode(subject);
-  let h1 = 0x811c9dc5;
-  let h2 = 0x01000193;
-  for (let i = 0; i < buf.length; i += 1) {
-    h1 = (h1 ^ buf[i]) * 0x01000193 >>> 0;
-    h2 = (h2 + buf[i] + (h1 >>> 0)) >>> 0;
+/**
+ * Android often puts the shared link inside `text` rather than `url`, so a
+ * URL found anywhere makes it a link. Images win over everything else.
+ */
+export async function draftFromShare(p: SharePayload): Promise<Draft> {
+  const title = p.title.trim();
+  const text = p.text.trim();
+  const image = p.files.find((f) => f.type.startsWith('image/'));
+  if (image) {
+    return { kind: 'image', subject: title || text || image.name || 'Image', content: await downscaleImage(image) };
   }
-  return `${h1.toString(16).padStart(8, '0')}-${h2.toString(16).padStart(8, '0')}-${buf.length}`;
+  const url = p.url.trim() || text.match(URL_RE)?.[0] || '';
+  if (url) {
+    const rest = text.replace(url, '').trim();
+    return { kind: 'link', subject: title || rest || hostOf(url), content: url };
+  }
+  return { kind: 'text', subject: title || firstLine(text), content: text };
 }
 
-/** Strip newlines / control chars for use as a DB column / log field. */
-export function sanitizeSubject(s: string): string {
-  return s.replace(/[\n\r\t]+/g, ' ').replace(/^\s+|\s+$/g, '').slice(0, 2000);
+function hostOf(url: string): string {
+  try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return url; }
+}
+
+function firstLine(text: string): string {
+  const line = text.split('\n')[0].trim();
+  return line.length > 80 ? `${line.slice(0, 77)}…` : line;
+}
+
+/** Re-encode as a JPEG no larger than `max` px so it fits in a D1 row. */
+export async function downscaleImage(file: File, max = 1024, quality = 0.8): Promise<string> {
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, max / Math.max(bitmap.width, bitmap.height));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(bitmap.width * scale);
+  canvas.height = Math.round(bitmap.height * scale);
+  canvas.getContext('2d')!.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close();
+  return canvas.toDataURL('image/jpeg', quality);
 }

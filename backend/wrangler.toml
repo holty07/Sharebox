@@ -1,20 +1,18 @@
 name = "sharebox"
 main = "src/index.ts"
+compatibility_date = "2025-09-01"
 
-[build]
-pattern = ["src/**/*", "migrations/**/*"]
+# Serve the built PWA; only /api/* reaches the Worker code first.
+[assets]
+directory = "../frontend/dist"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
 
-[[envs.project]]
-name = "production"
-
-[[deps]]
+# Create with `wrangler d1 create sharebox`, then paste the id here.
+[[d1_databases]]
 binding = "DB"
+database_name = "sharebox"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
 
-[vars]
-GEMINI_API_KEY = "CHANGE_ME"
-
-[envs.production.vars]
-GEMINI_API_KEY = { binding = "GEMINI_API_KEY", required = true }
-
-[openai]
-endpoint = "https://generativelanguage.googleapis.com/v1beta_models/gemini-3.5-flash:generateContent"  # unused by Worker; free Gemini via X-Goog-Api-Key
+# Secrets (wrangler secret put): SHAREBOX_JWT_SECRET, GEMINI_API_KEY

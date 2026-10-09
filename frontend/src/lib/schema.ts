@@ -1,10 +1,8 @@
-/**
- * Sharebox — client/server shared types.
- *
- * These mirror the worker's D1 schema exactly. The client owns them for
- * its Dexie store; the worker uses them via its own src/db.ts (INITIAL_SQL).
- */
+/** Types shared with the Worker (backend/src/sync.ts). Keep the two in step. */
 export type ItemKind = 'link' | 'text' | 'image';
+export type Entity = 'collections' | 'items';
+
+export const UNCATEGORIZED_ID = 'uncategorized';
 
 export interface Collection {
   id: string;
@@ -12,6 +10,7 @@ export interface Collection {
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
+  hlc: string;
 }
 
 export interface Item {
@@ -19,41 +18,37 @@ export interface Item {
   collection_id: string;
   subject: string;
   kind: ItemKind;
+  /** URL for links, the text for text, a JPEG data URL for images. */
   content: string;
-  tags: Record<string, string[]>;
+  tags: string[];
   notes: string;
-  status: 'uncategorised' | 'queued' | 'synced' | 'error';
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
+  hlc: string;
 }
 
-export type OpKind = 'create' | 'update' | 'delete';
+export type Row = Collection | Item;
 
 export interface PushOp {
-  op: OpKind;
-  entity: 'collections' | 'items';
-  entityId: string;
-  payload: string; // JSON-encoded entity
-  actor: string;
-  hlc: string; // "ts.logical" hybrid logical clock
+  entity: Entity;
+  row: Row;
 }
 
 export interface PullOp {
   seq: number;
-  op: OpKind;
-  entity: 'collections' | 'items';
-  entityId: string;
-  payload: string;
-  actor: string;
-  hlc: string;
-  receivedAt: string;
+  entity: Entity;
+  row: Row;
 }
 
-export interface SyncProgress {
-  pendingOps: number;
-  lastPushSeq: number;
-  serverMaxSeq: number;
-  phase: 'idle' | 'pushing' | 'pulling' | 'merged' | 'error';
-  error: string | null;
+export interface User {
+  id: string;
+  email: string;
+  display_name: string;
+}
+
+export interface ClassifyResult {
+  collectionId: string | null;
+  tags: string[];
+  notes: string;
 }

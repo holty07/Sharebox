@@ -6,39 +6,45 @@ export default defineConfig({
   plugins: [
     react(),
     VitePWA({
-      includeAssets: ['favicon.svg', 'icons/pwa-192x192.png', 'icons/pwa-512x512.png', 'icons/apple-touch-icon.png'],
+      strategies: 'injectManifest',
+      srcDir: 'src',
+      filename: 'sw.ts',
+      registerType: 'autoUpdate',
+      injectRegister: false, // registered in main.tsx
+      includeAssets: ['favicon.svg', 'icons/apple-touch-icon.png'],
+      injectManifest: { globPatterns: ['**/*.{js,css,html,svg,png,ico,woff2}'] },
       manifest: {
         name: 'Sharebox',
         short_name: 'Sharebox',
-        description: 'Free personal capture + auto-classification app',
+        description: 'Capture anything you share and sort it into your own collections',
         start_url: '/',
+        scope: '/',
         display: 'standalone',
-        orientation: 'any',
         background_color: '#0F172A',
         theme_color: '#0F172A',
         icons: [
           { src: 'icons/pwa-192x192.png', sizes: '192x192', type: 'image/png' },
           { src: 'icons/pwa-512x512.png', sizes: '512x512', type: 'image/png' },
-          { src: 'icons/pwa-512x512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
-          { src: 'icons/pwa-180x180.png', sizes: '180x180', type: 'image/png' },
+          { src: 'icons/pwa-maskable-512x512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
         ],
-      },
-      workbox: {
-        globPatterns: ['**/*.{js,css,html,svg,png,ico,woff2}'],
-        runtimeCaching: [
-          {
-            urlPattern: /^https:\/\/generativelanguage\.googleapis\.com\/.*/i,
-            handler: 'CacheFirst',
-            options: {
-              cacheName: 'gemini-cache',
-              expiration: { maxEntries: 64, maxAgeSeconds: 60 * 60 },
-            },
+        // Appears as "Sharebox" in the Android share sheet once the PWA is installed.
+        share_target: {
+          action: '/share',
+          method: 'POST',
+          enctype: 'multipart/form-data',
+          params: {
+            title: 'title',
+            text: 'text',
+            url: 'url',
+            files: [{ name: 'files', accept: ['image/*'] }],
           },
-        ],
+        },
       },
     }),
   ],
   server: {
     port: 5173,
+    // `wrangler dev` in ../backend serves the API.
+    proxy: { '/api': 'http://localhost:8787' },
   },
 });

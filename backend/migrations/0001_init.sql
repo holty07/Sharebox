@@ -1,56 +1,48 @@
--- 0001_init.sql
--- Users: personal workspaces (one user == one workspace in v1).
+-- Sharebox schema. Single owner: one row in users, no per-row user_id.
+
 CREATE TABLE IF NOT EXISTS users (
-  id           TEXT PRIMARY KEY,
-  email        TEXT NOT NULL UNIQUE,
+  id            TEXT PRIMARY KEY,
+  email         TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
   password_salt TEXT NOT NULL,
-  display_name TEXT NOT NULL,
-  created_at   TEXT NOT NULL,
-  updated_at   TEXT NOT NULL
+  display_name  TEXT NOT NULL,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
 );
 
--- Collections are fully user-defined; nothing is pre-seeded.
+-- User-defined collections. Only "uncategorized" is created (at register).
 CREATE TABLE IF NOT EXISTS collections (
-  id           TEXT PRIMARY KEY,
-  name         TEXT NOT NULL,
-  created_at   TEXT NOT NULL,
-  updated_at   TEXT NOT NULL,
-  deleted_at   TEXT
+  id         TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  deleted_at TEXT,
+  hlc        TEXT NOT NULL
 );
 
--- Items hold captured content (link / text / image).
 CREATE TABLE IF NOT EXISTS items (
-  id           TEXT PRIMARY KEY,
+  id            TEXT PRIMARY KEY,
   collection_id TEXT NOT NULL,
-  subject      TEXT NOT NULL,
-  kind         TEXT NOT NULL,
-  content      TEXT NOT NULL,
-  tags         TEXT NOT NULL DEFAULT '{}',
-  notes        TEXT,
-  status       TEXT NOT NULL DEFAULT 'queued',
-  created_at   TEXT NOT NULL,
-  updated_at   TEXT NOT NULL,
-  deleted_at   TEXT
+  subject       TEXT NOT NULL,
+  kind          TEXT NOT NULL,
+  content       TEXT NOT NULL,
+  tags          TEXT NOT NULL DEFAULT '[]',
+  notes         TEXT NOT NULL DEFAULT '',
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL,
+  deleted_at    TEXT,
+  hlc           TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_items_collection ON items(collection_id);
 
--- Append-only operation log drives two-way sync (push/pull) with
--- field-level HLC merge.
+-- Append-only log of accepted writes. Every op is a full-row put; deletes are
+-- rows with deleted_at set. Clients pull seq > since.
 CREATE TABLE IF NOT EXISTS sync_op (
-  seq      INTEGER PRIMARY KEY AUTOINCREMENT,
-  op_id    TEXT NOT NULL,
-  entity   TEXT NOT NULL,
-  entity_id TEXT NOT NULL,
-  payload  TEXT NOT NULL,
-  actor    TEXT NOT NULL,
-  hlc      TEXT NOT NULL DEFAULT '0.0.0',
-  received_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_sync_op_entity ON sync_op(entity, entity_id);
-CREATE INDEX IF NOT EXISTS idx_sync_op_received ON sync_op(received_at);
-
--- One auto-created "Uncategorized" collection per workspace (renamable).
-CREATE TABLE IF NOT EXISTS misc (
-  key   TEXT PRIMARY KEY,
-  value TEXT NOT NULL
+  seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity      TEXT NOT NULL,
+  entity_id   TEXT NOT NULL,
+  payload     TEXT NOT NULL,
+  actor       TEXT NOT NULL,
+  hlc         TEXT NOT NULL,
+  received_at TEXT NOT NULL
 );

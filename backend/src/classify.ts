@@ -1,241 +1,127 @@
 /**
- * src/classify.ts
+ * Server-side Gemini classification. The API key never leaves the Worker.
  *
- * Server-side Gemini classification with:
- *  - a local memoizer keyed on (contentHash, collection) so an item is sent
- *    to the model at most once per collection,
- *  - exponential-backoff retry on HTTP 429 (free-tier rate limits),
- *  - no thinking/JSON-mode extras so calls stay cheap and single-turn.
+ * - Collections are offered to the model by name; the answer is mapped back to an id.
+ * - Links: the Worker fetches the page and sends title + visible text.
+ * - Images: the stored data URL is sent as inline_data.
+ * - Results are memoised per isolate on sha256(content + collection names).
+ * - 429s are retried with exponential backoff.
  */
-import { geminiApiKeyOrAbort } from './secrets';
 import type { Env } from './env';
+import type { Collection, Item } from './sync';
 
-export interface ClassifyRequest {
-  subject: string;
-  subjectType: 'link' | 'text' | 'image';
-  collectionIds: string[];
-}
+const MODEL = 'gemini-3.5-flash';
+const ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
 
-export interface ClassifyResult {
-  collection: string;
-  tags: string[];
-  notes: string;
-}
-
-export interface GeminiPart {
-  text?: string;
-  inlineData?: { data: string; mimeType: string };
-}
-
-export interface GeminiGenerateParams {
-  model: string;
-  contents: { role: string; parts: GeminiPart[] }[];
-  systemInstruction?: string;
-}
-
-const GEMINI_MODEL = 'gemini-3.5-flash';
-const TEXT_MODEL = 'gemini-3.5-flash'; // free tier; supports image input too
 const SYSTEM_PROMPT = [
   'You are a personal content classifier for a private capture app.',
-  'Decide whether the incoming item belongs in each of the provided collections.',
-  'Respond with ONLY a JSON object:',
-  '  { "collection": "<collection name>", "tags": ["...", "..."], "notes": "..." }',
-  'Rules:',
-  '  1. "collection" must exactly match an existing collection name, or "UNCLASSIFIED" if none fits.',
-  '  2. "tags" is a short array of lowercase, comma-free labels.',
-  '  3. "notes" summarises the item in one short sentence.',
-  '  4. Output no markdown fences, no commentary, no apologies.',
+  'Pick the single best collection for the item from the numbered list, or NONE if nothing fits.',
+  'Respond with only JSON: {"collection": "<exact collection name or NONE>", "tags": ["..."], "notes": "..."}.',
+  '"tags" is 1-5 short lowercase labels. "notes" is one short sentence summarising the item.',
 ].join(' ');
 
-// ---- memoizer: one classification per (hash, collection) ----
-
-interface CacheEntry {
-  hash: string;
-  collection: string;
+export interface ClassifyResult {
+  collectionId: string | null;
   tags: string[];
   notes: string;
-  ts: number;
 }
 
-const memo = new Map<string, CacheEntry>();
-const MAX_MEMO = 2048;
+type Part = { text: string } | { inline_data: { mime_type: string; data: string } };
 
-function cacheKey(hash: string, collection: string): string {
-  return `${hash}:${collection}`;
+const memo = new Map<string, ClassifyResult>();
+const MAX_MEMO = 500;
+
+async function sha256(s: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-export function memoHit(key: string): boolean {
-  return memo.has(key);
-}
-
-export function memoPut(hash: string, collection: string, entry: CacheEntry): void {
-  const k = cacheKey(hash, collection);
-  memo.set(k, entry);
-  if (memo.size > MAX_MEMO) {
-    // evict least-recently-used-ish (FIFO is fine for this scale)
-    const first = memo.keys().next().value;
-    if (first !== undefined) memo.delete(first);
+async function fetchPageText(url: string): Promise<string> {
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Sharebox/1.0)', Accept: 'text/html' },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok || !(res.headers.get('content-type') ?? '').includes('html')) return '';
+    const html = (await res.text()).slice(0, 500_000);
+    const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.trim() ?? '';
+    const desc = html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["']/i)?.[1] ?? '';
+    const body = html
+      .replace(/<(script|style|noscript)[\s\S]*?<\/\1>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 6000);
+    return [`Page title: ${title}`, desc && `Description: ${desc}`, `Page text: ${body}`].filter(Boolean).join('\n');
+  } catch {
+    return '';
   }
 }
 
-export function memoGet(hash: string, collection: string): CacheEntry | undefined {
-  const k = cacheKey(hash, collection);
-  return memo.get(k);
-}
-
-// ---- Gemini call ----
-
-function buildContents(req: ClassifyRequest): { role: string; parts: GeminiPart[] }[] {
-  const { subject, subjectType, collectionIds } = req;
-
-  if (subjectType === 'image') {
-    // Content is the raw image bytes (base64) passed in as a second field;
-    // the caller attaches it via the `parts` below.
-    return [
-      {
-        role: 'user',
-        parts: [
-          { text: buildUserText(subject, subjectType, collectionIds) },
-          { inlineData: { data: subject, mimeType: 'image/jpeg' } },
-        ],
-      },
-    ];
+async function itemParts(item: Item): Promise<Part[]> {
+  const header = `Item kind: ${item.kind}\nSubject: ${item.subject}`;
+  if (item.kind === 'image') {
+    const m = item.content.match(/^data:([^;]+);base64,(.+)$/);
+    if (!m) return [{ text: header }];
+    return [{ text: header }, { inline_data: { mime_type: m[1], data: m[2] } }];
   }
-
-  // link / text: subject already contains title + extracted text for links
-  return [
-    {
-      role: 'user',
-      parts: [{ text: buildUserText(subject, subjectType, collectionIds) }],
-    },
-  ];
-}
-
-function buildUserText(subject: string, subjectType: 'link' | 'text' | 'image', collectionIds: string[]): string {
-  const items = collectionIds.map((id) => `# ${id}`).join('\n');
-  return [
-    SYSTEM_PROMPT,
-    '',
-    'Target collections (ids):',
-    items,
-    '',
-    'Item content:',
-    subject,
-  ].join('\n');
-}
-
-export async function classify(
-  req: ClassifyRequest,
-  env?: Env,
-): Promise<ClassifyResult> {
-  // 1. memoize: skip if this (hash, collection) already classified
-  const hash = await contentHash(req.subject, req.subjectType);
-  for (const collectionId of req.collectionIds) {
-    const hit = memoGet(hash, collectionId);
-    if (hit) return { collection: hit.collection, tags: hit.tags, notes: hit.notes };
+  if (item.kind === 'link') {
+    const page = await fetchPageText(item.content);
+    return [{ text: `${header}\nURL: ${item.content}\n${page}` }];
   }
+  return [{ text: `${header}\nText: ${item.content.slice(0, 8000)}` }];
+}
 
-  // 2. call Gemini with exponential backoff on 429
-  const apiKey = geminiApiKeyOrAbort(env);
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
-  const payload: GeminiGenerateParams = {
-    model: GEMINI_MODEL,
-    contents: buildContents(req),
-    systemInstruction: SYSTEM_PROMPT,
+export async function classifyItem(item: Item, collections: Collection[], env: Env): Promise<ClassifyResult> {
+  if (!env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not configured (wrangler secret put GEMINI_API_KEY)');
+  const names = collections.map((c) => c.name);
+  const key = await sha256(`${item.kind}\n${item.content}\n${names.join('\n')}`);
+  const cached = memo.get(key);
+  if (cached) return cached;
+
+  const list = names.map((n, i) => `${i + 1}. ${n}`).join('\n');
+  const body = {
+    system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
+    contents: [{ role: 'user', parts: [{ text: `Collections:\n${list}` }, ...(await itemParts(item))] }],
+    generationConfig: { responseMimeType: 'application/json', temperature: 0 },
   };
 
-  let lastErr: unknown;
-  let lastStatus = 0;
-  const maxBackoff = 2 ** 8; // 256s ceiling
-  let backoff = 1;
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    let res: Response | undefined;
-    try {
-      res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-
-      if (res.status === 429) {
-        lastErr = new Error(`Gemini 429 (rate limited), attempt ${attempt + 1}`);
-        await sleep(backoff);
-        backoff = Math.min(backoff * 2, maxBackoff);
-        continue;
-      }
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`Gemini ${res.status}: ${text.slice(0, 300)}`);
-      }
-
-      const json = (await res.json()) as {
-        candidates?: { content?: { parts?: { text?: string }[] } }[];
-        error?: { message?: string };
-      };
-      const text = (json.candidates?.[0]?.content?.parts?.[0]?.text ?? '').trim();
-      if (!text) {
-        throw new Error('Empty Gemini response');
-      }
-      const entry = parseJsonResult(text, req.collectionIds);
-      // memoize the successful result
-      for (const collectionId of req.collectionIds) {
-        memoPut(hash, collectionId, entry);
-      }
-      return entry;
-    } catch (err) {
-      lastErr = err;
-      // 429 already handled above (continue); re-throw non-429 after final attempt
-      if (res && res.status !== 429) break;
-    }
+  let res: Response | null = null;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    res = await fetch(ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': env.GEMINI_API_KEY },
+      body: JSON.stringify(body),
+    });
+    if (res.status !== 429) break;
+    await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
   }
-  throw lastErr ?? new Error('Unknown classify failure');
+  if (!res || !res.ok) {
+    const detail = res ? (await res.text()).slice(0, 300) : '';
+    throw new Error(`Gemini request failed (${res?.status ?? 'no response'}): ${detail}`);
+  }
+
+  const json = (await res.json()) as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
+  const text = json.candidates?.[0]?.content?.parts?.map((p) => p.text ?? '').join('').trim() ?? '';
+  const result = parseResult(text, collections);
+  memo.set(key, result);
+  if (memo.size > MAX_MEMO) memo.delete(memo.keys().next().value as string);
+  return result;
 }
 
-function parseJsonResult(
-  raw: string,
-  collectionIds: string[],
-): CacheEntry {
-  // Strip any surrounding whitespace / stray characters
-  const cleaned = raw.replace(/^```(?:json|JSON)?\s*|\s*```$/g, '').trim();
+function parseResult(text: string, collections: Collection[]): ClassifyResult {
   let obj: Record<string, unknown>;
   try {
-    obj = JSON.parse(cleaned) as Record<string, unknown>;
+    obj = JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, '')) as Record<string, unknown>;
   } catch {
-    throw new Error(`Unparseable Gemini JSON: ${cleaned.slice(0, 200)}`);
+    throw new Error(`Gemini returned non-JSON: ${text.slice(0, 200)}`);
   }
-  const collection = String(obj.collection ?? 'UNCLASSIFIED').trim();
+  const name = typeof obj.collection === 'string' ? obj.collection.trim().toLowerCase() : '';
+  const match = collections.find((c) => c.name.trim().toLowerCase() === name);
   const tags = Array.isArray(obj.tags)
-    ? obj.tags.filter((t): t is string => typeof t === 'string').map((t) => t.toLowerCase().trim()).filter(Boolean)
+    ? obj.tags.filter((t): t is string => typeof t === 'string').map((t) => t.trim().toLowerCase()).filter(Boolean).slice(0, 5)
     : [];
-  const notes = typeof obj.notes === 'string' ? obj.notes.trim() : '';
-  return { hash: '', collection, tags, notes, ts: Date.now() };
-}
-
-// ---- helpers ----
-
-async function contentHash(subject: string, subjectType: 'link' | 'text' | 'image'): Promise<string> {
-  const input = subjectType === 'image' ? subject : subject;
-  const buf = new TextEncoder().encode(input);
-  let h = 0;
-  for (const b of buf) {
-    h = (h * 31 + b) >>> 0;
-  }
-  // Fold into a 64-bit hex for readability
-  return `sha1-${h.toString(16).padStart(16, '0')}-${buf.length}`;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function mapEntry(entry: CacheEntry): ClassifyResult {
-  return {
-    collection: entry.collection,
-    tags: entry.tags,
-    notes: entry.notes,
-  };
-}
-
-export function resetMemo(): void {
-  memo.clear();
+  return { collectionId: match?.id ?? null, tags, notes: typeof obj.notes === 'string' ? obj.notes.trim() : '' };
 }
