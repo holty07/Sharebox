@@ -1,0 +1,20 @@
+name = "sharebox"
+main = "src/index.ts"
+
+[build]
+pattern = ["src/**/*", "migrations/**/*"]
+
+[[envs.project]]
+name = "production"
+
+[[deps]]
+binding = "DB"
+
+[vars]
+GEMINI_API_KEY = "CHANGE_ME"
+
+[envs.production.vars]
+GEMINI_API_KEY = { binding = "GEMINI_API_KEY", required = true }
+
+[openai]
+endpoint = "https://generativelanguage.googleapis.com/v1beta_models/gemini-3.5-flash:generateContent"  # unused by Worker; free Gemini via X-Goog-Api-Key

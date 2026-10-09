@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sharebox — Add to Sharebox</title>
+    <script>
+      (async () => {
+        const params = new URLSearchParams(location.search);
+        const text = params.get('text') ?? '';
+        const url = params.get('url') ?? '';
+        const subject = params.get('subject') ?? '';
+        const shareData = [];
+        if (url) shareData.push(url);
+        if (text) shareData.push(text);
+        if (subject) shareData.push(subject);
+        if (shareData.length) {
+          const app = await navigator.share ? navigator.share({ title: 'Sharebox', text: shareData.join('\n') }) : null;
+          if (!app && shareData.length === 1) {
+            // direct deep link to the app's route
+            const s = encodeURIComponent(shareData[0]);
+            const u = url ? `/?url=${s}` : `/?text=${s}`;
+            location.replace(u);
+          }
+        } else {
+          location.replace('/');
+        }
+      })();
+    </script>
+  </head>
+  <body></body>
+</html>
